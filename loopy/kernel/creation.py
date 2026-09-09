@@ -1900,8 +1900,8 @@ def apply_single_writer_dependency_heuristic(
         error_if_used: bool = False) -> LoopKernel:
     logger.debug("%s: default deps" % kernel.name)
 
-    from loopy.transform.subst import expand_subst
-    expanded_kernel = expand_subst(kernel)
+    from loopy.kernel.tools import get_instruction_dependency_info
+    instruction_dependency_info = get_instruction_dependency_info(kernel)
 
     writer_map = kernel.writer_map()
 
@@ -1910,8 +1910,11 @@ def apply_single_writer_dependency_heuristic(
     var_names = arg_names | set(kernel.temporary_variables.keys())
 
     dep_map = {
-            insn.id: insn.read_dependency_names() & var_names
-            for insn in expanded_kernel.instructions}
+            insn.id: (
+                instruction_dependency_info[insn.id].read_dependency_names
+                & var_names
+            )
+            for insn in kernel.instructions}
 
     changed = False
     new_insns: list[InstructionBase] = []
@@ -2477,12 +2480,33 @@ def make_function(
 
         substitutions = substitutions.set(sname, rule)
 
-    arg_guesser = ArgumentGuesser(parsed_domains, instructions,
-            temporary_variables, substitutions,
-            default_offset)
+    from loopy.symbolic import get_reduction_inames, get_sub_array_ref_swept_inames
 
-    kernel_args = arg_guesser.convert_names_to_full_args(kernel_args)
-    kernel_args = arg_guesser.guess_kernel_args_if_requested(kernel_args)
+    # Validate even unused rules, whether or not argument guessing is requested.
+    for rule in substitutions.values():
+        invalid_inames = (
+            frozenset(rule.arguments)
+            & (
+                get_reduction_inames(rule.expression)
+                | get_sub_array_ref_swept_inames(rule.expression)
+            )
+        )
+        if invalid_inames:
+            iname = min(invalid_inames)
+            raise LoopyError(
+                f"substitution rule argument '{iname}' cannot be used as "
+                "a reduction or swept iname in the same rule"
+            )
+
+    if any(isinstance(arg, (str, EllipsisType)) for arg in kernel_args):
+        arg_guesser = ArgumentGuesser(parsed_domains, instructions,
+                temporary_variables, substitutions,
+                default_offset)
+
+        kernel_args = arg_guesser.convert_names_to_full_args(kernel_args)
+        kernel_args = arg_guesser.guess_kernel_args_if_requested(kernel_args)
+    else:
+        kernel_args = cast("Sequence[KernelArgument]", kernel_args)
 
     from pytools.tag import check_tag_uniqueness, normalize_tags
     tags = check_tag_uniqueness(normalize_tags(tags))

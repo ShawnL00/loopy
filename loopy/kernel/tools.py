@@ -24,6 +24,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 """
 
+import dataclasses
 import itertools
 import logging
 import sys
@@ -46,6 +47,7 @@ from loopy.kernel import LoopKernel
 from loopy.kernel.data import ArrayArg, KernelArgument, TemporaryVariable
 from loopy.kernel.function_interface import CallableKernel
 from loopy.kernel.instruction import (
+    Assignment,
     CInstruction,
     InstructionBase,
     MultiAssignmentBase,
@@ -208,12 +210,135 @@ def _add_and_infer_dtypes_overdetermined(kernel, dtype_dict):
 # }}}
 
 
+# {{{ substitution-rule dependency information
+
+@dataclasses.dataclass(frozen=True)
+class InstructionDependencyInfo:
+    """Dependency names and reduction inames after conceptual rule expansion.
+
+    .. attribute:: read_dependency_names
+
+        A :class:`frozenset` of names read by the instruction, including
+        assignee indices and predicates, but not an assignee solely because
+        it is written.
+
+    .. attribute:: write_dependency_names
+
+        A :class:`frozenset` of assigned variable names and names read by
+        their indices after substitution-rule expansion.
+
+    .. attribute:: reduction_inames
+
+        A :class:`frozenset` of reduction inames in the instruction's
+        right-hand-side expression.
+    """
+
+    read_dependency_names: frozenset[str]
+    reduction_inames: frozenset[str]
+    write_dependency_names: frozenset[str]
+
+
+def get_instruction_dependency_info(
+        kernel: LoopKernel,
+    ) -> dict[str, InstructionDependencyInfo]:
+    """Return dependency information keyed by instruction ID.
+
+    Results agree with each instruction's :meth:`read_dependency_names
+    <loopy.kernel.instruction.InstructionBase.read_dependency_names>`,
+    :meth:`write_dependency_names
+    <loopy.kernel.instruction.InstructionBase.write_dependency_names>`, and
+    :meth:`reduction_inames
+    <loopy.kernel.instruction.InstructionBase.reduction_inames>` after full
+    substitution-rule expansion.
+
+    Ordinary assignments, including array indices and predicates, use cached
+    rule summaries. Other instruction types, tags, sub-array references, and
+    substitutions that may change reduction binding use expansion instead.
+    Neither path modifies *kernel*.
+
+    :arg kernel: a kernel with acyclic substitution rules.
+    """
+    from pymbolic.primitives import Subscript, Variable
+
+    from loopy.symbolic import (
+        LinearSubscript,
+        _SubstitutionRuleAwareDependencyMapper,
+        _SubstitutionRuleDependencyFallbackError,
+        _SubstitutionRuleDependencyInfo,
+    )
+
+    if kernel.substitutions:
+        rule_cache: dict[
+            tuple[str, tuple[_SubstitutionRuleDependencyInfo, ...]],
+            _SubstitutionRuleDependencyInfo,
+        ] = {}
+        result_by_instruction_id: dict[str, InstructionDependencyInfo] = {}
+        try:
+            for insn in kernel.instructions:
+                if not isinstance(insn, Assignment):
+                    raise _SubstitutionRuleDependencyFallbackError
+
+                assignee = insn.assignee
+                if type(assignee) is Variable:
+                    base = assignee
+                    index_names = frozenset()
+                elif isinstance(assignee, (Subscript, LinearSubscript)):
+                    base = assignee.aggregate
+                    index_names = _SubstitutionRuleAwareDependencyMapper(
+                        kernel.substitutions, rule_cache=rule_cache
+                    ).get_dependency_info(assignee.index).dependency_names
+                else:
+                    raise _SubstitutionRuleDependencyFallbackError
+
+                if type(base) is not Variable or base.name in kernel.substitutions:
+                    raise _SubstitutionRuleDependencyFallbackError
+
+                expression_info = _SubstitutionRuleAwareDependencyMapper(
+                    kernel.substitutions, rule_cache=rule_cache
+                ).get_dependency_info(insn.expression)
+                read_names = set(expression_info.dependency_names | index_names)
+                for predicate in insn.predicates:
+                    read_names.update(_SubstitutionRuleAwareDependencyMapper(
+                        kernel.substitutions, rule_cache=rule_cache
+                    ).get_dependency_info(predicate).dependency_names)
+
+                result_by_instruction_id[insn.id] = InstructionDependencyInfo(
+                    read_dependency_names=frozenset(read_names),
+                    reduction_inames=expression_info.reduction_inames,
+                    write_dependency_names=frozenset({base.name}) | index_names,
+                )
+        except _SubstitutionRuleDependencyFallbackError:
+            pass
+        else:
+            return result_by_instruction_id
+
+        from loopy.transform.subst import expand_subst
+        kernel = expand_subst(kernel)
+
+    return {
+        insn.id: InstructionDependencyInfo(
+            read_dependency_names=frozenset(insn.read_dependency_names()),
+            reduction_inames=frozenset(insn.reduction_inames()),
+            write_dependency_names=frozenset(insn.write_dependency_names()),
+        )
+        for insn in kernel.instructions
+    }
+
+
+# }}}
+
+
 # {{{ find_all_insn_inames fixed point iteration (deprecated)
 
 def guess_iname_deps_based_on_var_use(
         kernel: LoopKernel,
         insn: InstructionBase,
         insn_id_to_inames: dict[str, InameStrSet] | None = None,
+        *,
+        read_dependency_names: frozenset[str] | None = None,
+        reduction_inames: frozenset[str] | None = None,
+        write_dependency_names_by_insn_id: (
+            Mapping[str, frozenset[str]] | None) = None,
     ) -> InameStrSet:
     # For all variables that insn depends on, find the intersection
     # of iname deps of all writers, and add those to insn's
@@ -223,7 +348,12 @@ def guess_iname_deps_based_on_var_use(
 
     writer_map = kernel.writer_map()
 
-    for tv_name in (insn.read_dependency_names() & kernel.get_written_variables()):
+    if read_dependency_names is None:
+        read_dependency_names = frozenset(insn.read_dependency_names())
+    if reduction_inames is None:
+        reduction_inames = frozenset(insn.reduction_inames())
+
+    for tv_name in (read_dependency_names & kernel.get_written_variables()):
         tv_implicit_inames = None
 
         for writer_id in writer_map[tv_name]:
@@ -233,9 +363,13 @@ def guess_iname_deps_based_on_var_use(
             else:
                 writer_inames = insn_id_to_inames[writer_id]
 
+            writer_write_names = (
+                writer_insn.write_dependency_names()
+                if write_dependency_names_by_insn_id is None
+                else write_dependency_names_by_insn_id[writer_id])
             writer_implicit_inames = (
                     writer_inames
-                    - (writer_insn.write_dependency_names() & kernel.all_inames()))
+                    - (writer_write_names & kernel.all_inames()))
             if tv_implicit_inames is None:
                 tv_implicit_inames = writer_implicit_inames
             else:
@@ -245,7 +379,7 @@ def guess_iname_deps_based_on_var_use(
         if tv_implicit_inames is not None:
             result = result | tv_implicit_inames
 
-    return result - insn.reduction_inames()
+    return result - reduction_inames
 
 
 def find_all_insn_inames(kernel: LoopKernel) -> dict[str, InameStrSet]:
@@ -259,12 +393,12 @@ def find_all_insn_inames(kernel: LoopKernel) -> dict[str, InameStrSet]:
     all_read_deps: dict[str, frozenset[str]] = {}
     all_write_deps: dict[str, frozenset[str]] = {}
 
-    from loopy.transform.subst import expand_subst
-    kernel = expand_subst(kernel)
+    insn_dependency_info = get_instruction_dependency_info(kernel)
 
     for insn in kernel.instructions:
-        all_read_deps[insn.id] = read_deps = frozenset(insn.read_dependency_names())
-        all_write_deps[insn.id] = write_deps = frozenset(insn.write_dependency_names())
+        info = insn_dependency_info[insn.id]
+        all_read_deps[insn.id] = read_deps = info.read_dependency_names
+        all_write_deps[insn.id] = write_deps = info.write_dependency_names
         deps = read_deps | write_deps
 
         if insn.within_inames_is_final:
@@ -310,8 +444,12 @@ def find_all_insn_inames(kernel: LoopKernel) -> dict[str, InameStrSet]:
             # {{{ dependency-based propagation
 
             inames_old = insn_id_to_inames[insn.id]
+            info = insn_dependency_info[insn.id]
             inames_new = inames_old | guess_iname_deps_based_on_var_use(
-                    kernel, insn, insn_id_to_inames)
+                    kernel, insn, insn_id_to_inames,
+                    read_dependency_names=info.read_dependency_names,
+                    reduction_inames=info.reduction_inames,
+                    write_dependency_names_by_insn_id=all_write_deps)
 
             insn_id_to_inames[insn.id] = inames_new
 

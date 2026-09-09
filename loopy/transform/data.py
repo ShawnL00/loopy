@@ -573,11 +573,14 @@ set_array_dim_names = (MovedFunctionDeprecationWrapper(
 @for_each_kernel
 def remove_unused_arguments(kernel: LoopKernel):
     import loopy as lp
-    exp_kernel = lp.expand_subst(kernel)
+    from loopy.kernel.tools import get_instruction_dependency_info
+
+    dep_info = get_instruction_dependency_info(kernel)
 
     refd_vars = set(kernel.all_params())
-    for insn in exp_kernel.instructions:
-        refd_vars.update(insn.dependency_names())
+    for insn in kernel.instructions:
+        refd_vars.update(dep_info[insn.id].read_dependency_names)
+        refd_vars.update(insn.assignee_var_names())
 
     from itertools import chain
 

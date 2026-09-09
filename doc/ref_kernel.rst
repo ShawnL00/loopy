@@ -632,6 +632,21 @@ Substitution Rule Objects
 
 .. autoclass:: SubstitutionRule
 
+Dependency Queries
+^^^^^^^^^^^^^^^^^^
+
+These queries use cached dependency summaries for ordinary assignments,
+array indexing, predicates, and reductions over acyclic substitution-rule graphs.
+Unsupported constructs, including tags and sub-array references, and substitutions
+that may change reduction binding use Loopy's existing expansion-based analysis.
+Neither path materializes intermediates or alters the input kernel.
+
+.. autofunction:: loopy.symbolic.get_substitution_rule_dependencies
+
+.. autoclass:: loopy.kernel.tools.InstructionDependencyInfo
+
+.. autofunction:: loopy.kernel.tools.get_instruction_dependency_info
+
 .. _subst-rule-syntax:
 
 Textual Syntax for Substitution Rules
